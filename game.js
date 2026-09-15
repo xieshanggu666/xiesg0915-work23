@@ -277,6 +277,20 @@ function enterAutoPilot(room, playerId, reason = 'disconnect') {
   return !wasAuto;
 }
 
+// 行动玩家在托管中且当前回合正因托管暂停而停表时，用暂停点剩余时间恢复倒计时。
+// 质疑仍在裁定（pendingChallenge）时不动——计时归质疑暂停所有，等裁定结束再恢复。
+// 返回是否实际恢复了计时。供重连收回（releaseAutoPilot / resumeOnReconnect）共用，
+// 保证"掉线→重连"和"掉线→重启→重连"两条路径恢复口径完全一致。
+function resumePausedTurn(room, playerId) {
+  const t = room.turn;
+  if (!t || t.playerId !== playerId || room.pendingChallenge) return false;
+  if (t.deadline || t.pausedRemaining == null) return false;
+  t.deadline = Date.now() + Math.max(0, t.pausedRemaining);
+  t.pausedRemaining = null;
+  t.pausedReason = null;
+  return true;
+}
+
 // 重连（或在线玩家轮到自己）时立即收回控制权：清托管标记；若当前是行动玩家且计时
 // 正因"托管"暂停而停住，恢复倒计时。质疑暂停（pausedReason='challenge'）不恢复。
 function releaseAutoPilot(room, playerId, { reason = 'reconnect' } = {}) {
@@ -284,16 +298,32 @@ function releaseAutoPilot(room, playerId, { reason = 'reconnect' } = {}) {
   if (!p || !p.autoPilot) return false;
   p.autoPilot = false;
   logEvent(room, 'resume', { playerId, reason });
-  // 行动玩家收回：若无待裁定质疑且计时正停着，恢复倒计时；
-  // 质疑仍在裁定时保持质疑暂停，待裁定结束后恢复。
-  if (room.turn && room.turn.playerId === playerId &&
-      !room.turn.deadline && room.turn.pausedRemaining != null &&
-      !room.pendingChallenge) {
-    room.turn.deadline = Date.now() + room.turn.pausedRemaining;
-    room.turn.pausedRemaining = null;
-    room.turn.pausedReason = null;
-  }
+  resumePausedTurn(room, playerId);
   return true;
+}
+
+// 服务器重启后的玩家重连：重启会清掉 autoPilot 临时标记、玩家统一按普通离线处理，
+// 因此这里不能依赖 autoPilot。它做三件事，保证重启前后状态一致：
+//  1) 若该玩家是行动玩家、其回合仍处于暂停（重启保留了 pausedRemaining，见 loadRooms），
+//     用暂停点剩余时间恢复倒计时——重启不会把暂停态错误重置成完整一回合；
+//  2) 若待裁定质疑的裁定者已不在线，把裁定权移交给重连回来的合格玩家（或其他人）；
+//  3) 行动玩家此前在托管暂停中，重连即收回，记一条 resume 日志让回放可见。
+function resumeOnReconnect(room, playerId) {
+  let resumed = false;
+  const p = room.players.find(x => x.id === playerId);
+  if (p && p.autoPilot) {
+    p.autoPilot = false;
+    resumed = true;
+  }
+  // 行动玩家的暂停回合恢复计时（重启保留的质疑/托管暂停都可能走到这里；
+  // 质疑仍在裁定时 resumePausedTurn 内部不会动）。
+  const wasPaused = !!room.turn && room.turn.playerId === playerId &&
+    !room.turn.deadline && room.turn.pausedRemaining != null && !room.pendingChallenge;
+  if (resumePausedTurn(room, playerId)) resumed = true;
+  // 重启后待裁定质疑的原裁定者可能已离线：重连时尝试把裁定权交给在线合格玩家。
+  if (ensureAdjudicatorOnline(room)) resumed = true;
+  if (resumed || wasPaused) logEvent(room, 'resume', { playerId, reason: 'reconnect' });
+  return resumed || wasPaused;
 }
 
 // ---------- 行动 ----------
@@ -441,17 +471,22 @@ function resolveChallenge(room, playerId, verdict) {
     cascadeRemove(room, node.id, removed);
   }
   room.pendingChallenge = null;
-  // 恢复计时：仅当初是被"质疑"暂停、且行动玩家当前不在托管时才恢复。
-  // 行动玩家可能在质疑期间掉线托管（此时暂停原因仍标记为 challenge），
-  // 质疑结束后应转为托管暂停继续停表，等其重连收回时再恢复。
+  // 恢复计时：仅当行动玩家当前在线且未托管时才恢复——行动玩家可能在质疑期间掉线
+  // （重启后按普通离线处理，或其 autoPilot 仍在），此时转为托管暂停继续停表，
+  // 等其重连收回时再用暂停点剩余时间恢复，避免裁定结束立刻按一个已过期的 deadline 超时。
   const activePlayer = room.turn && room.players.find(p => p.id === room.turn.playerId);
-  const activeAuto = !!activePlayer && activePlayer.autoPilot;
-  if (room.turn && room.turn.pausedRemaining != null && !activeAuto) {
-    room.turn.deadline = Date.now() + room.turn.pausedRemaining;
-    room.turn.pausedRemaining = null;
-    room.turn.pausedReason = null;
-  } else if (room.turn && activeAuto && room.turn.pausedRemaining != null) {
-    room.turn.pausedReason = 'autopilot';
+  const activeAvailable = !!activePlayer && activePlayer.connected && !activePlayer.autoPilot;
+  if (room.turn && room.turn.pausedRemaining != null) {
+    if (activeAvailable) {
+      // 兜底：暂停剩余时间已耗尽（如服务器在暂停中停留极久）时给 1 秒缓冲，
+      // 而不是恢复一个 deadline≈now、定时器一挂就立即超时的回合。
+      const remain = Math.max(1000, room.turn.pausedRemaining);
+      room.turn.deadline = Date.now() + remain;
+      room.turn.pausedRemaining = null;
+      room.turn.pausedReason = null;
+    } else {
+      room.turn.pausedReason = 'autopilot'; // 行动玩家掉线/托管：继续停表等重连
+    }
   }
   logEvent(room, 'resolve', { challengeId: ch.id, verdict,
     removed: removed.map(n => n.id) });
@@ -723,7 +758,7 @@ module.exports = {
   resetConnectionsAfterRestart,
   setRuleSet, setWordPack, sanitizeWordPack, startGame,
   playWord, reinforce, endTurn, challenge, resolveChallenge, ensureAdjudicatorOnline,
-  isAutoPilot, enterAutoPilot, releaseAutoPilot, applyTurnMsOverride,
+  isAutoPilot, enterAutoPilot, releaseAutoPilot, resumeOnReconnect, applyTurnMsOverride,
   computeScores, buildReplay, publicView, cascadeRemove, historySummary,
   isRoomExpired, pruneExpiredRooms, roomKey, ensureRoomId,
 };

@@ -479,6 +479,140 @@ test('公开视图暴露 autoPilot 标记', () => {
   assert.strictEqual(view.players.find(p => p.id === 'p0').autoPilot, false);
 });
 
+// ---------- 重启后暂停状态一致性 ----------
+// loadRooms 重启恢复时的等价纯逻辑处理：质疑暂停 / 托管暂停保留 pausedRemaining，
+// 只有正常进行中的回合才给完整倒计时。这里复刻关键转换并验证重连/裁定的恢复口径。
+
+function simulateRestartRoom(room) {
+  room.players.forEach(p => { p.connected = false; p.autoPilot = false; });
+  (room.spectators || []).forEach(s => { s.connected = false; });
+  const t = room.turn;
+  if (room.phase === 'playing' && t) {
+    if (room.pendingChallenge && !t.deadline) {
+      t.pausedReason = 'challenge';
+    } else if (!t.deadline && t.pausedRemaining != null) {
+      t.pausedReason = t.pausedReason === 'challenge' ? 'challenge' : 'autopilot';
+    } else if (!t.deadline) {
+      t.deadline = Date.now() + room.ruleSet.turnSeconds * 1000;
+      t.pausedRemaining = null; t.pausedReason = null;
+    } else {
+      t.deadline = Date.now() + room.ruleSet.turnSeconds * 1000;
+    }
+  }
+  return room;
+}
+
+test('重启保留托管暂停的剩余时间：行动玩家重连后用暂停点剩余时间恢复', () => {
+  const room = makeRoom(['甲', '乙']);
+  room.ruleSet.turnSeconds = 90;
+  playOk(room, '开心');
+  // 人为制造"已用掉一段时间"的暂停点（剩余明显小于完整回合）
+  room.turn.deadline = Date.now() + 30000;
+  // 掉线托管：暂停并保存剩余时间
+  room.players[0].connected = false;
+  g.enterAutoPilot(room, 'p0', 'disconnect');
+  const savedRemaining = room.turn.pausedRemaining;
+  assert.ok(savedRemaining > 20000 && savedRemaining <= 30000);
+
+  // 重启：autoPilot 被清、玩家离线，但暂停剩余时间保留（不再重置成完整一回合）
+  simulateRestartRoom(room);
+  assert.strictEqual(g.isAutoPilot(room, 'p0'), false, '重启不保留临时托管标记');
+  assert.strictEqual(room.turn.deadline, null, '重启不把托管暂停恢复成倒计时');
+  assert.strictEqual(room.turn.pausedRemaining, savedRemaining, '保留暂停点剩余时间');
+  assert.strictEqual(room.turn.pausedReason, 'autopilot');
+
+  // 重连：立即用暂停点剩余时间恢复，而不是完整 turnSeconds
+  room.players[0].connected = true;
+  const resumed = g.resumeOnReconnect(room, 'p0');
+  assert.strictEqual(resumed, true);
+  assert.ok(room.turn.deadline);
+  assert.strictEqual(room.turn.pausedRemaining, null);
+  const restored = room.turn.deadline - Date.now();
+  assert.ok(Math.abs(restored - savedRemaining) < 500, '恢复的是原剩余时间');
+  assert.ok(restored < room.ruleSet.turnSeconds * 1000 - 50000, '不是完整一回合');
+});
+
+test('重启保留质疑暂停的剩余时间：裁定结束后用原剩余时间恢复而非立即超时', () => {
+  const room = makeRoom(['甲', '乙', '丙', '丁']);
+  room.ruleSet.turnSeconds = 90;
+  playOk(room, '开心');
+  const node = room.nodes.find(n => n.word === '开心');
+  g.challenge(room, 'p2', node.id); // 房主 p0 是词主，顺延给第一个合格的在线非托管玩家
+  const adjudicator = room.pendingChallenge.adjudicatorId;
+  assert.notStrictEqual(adjudicator, 'p0');
+  assert.notStrictEqual(adjudicator, 'p2');
+  room.turn.pausedRemaining = 30000; // 人为设定一个明显小于完整回合的剩余时间
+  const savedRemaining = room.turn.pausedRemaining;
+
+  // 重启：质疑仍在、计时保持暂停，剩余时间原样保留
+  simulateRestartRoom(room);
+  assert.ok(room.pendingChallenge, '待裁定质疑随房间保留');
+  assert.strictEqual(room.turn.deadline, null);
+  assert.strictEqual(room.turn.pausedRemaining, savedRemaining);
+  assert.strictEqual(room.turn.pausedReason, 'challenge');
+
+  // 裁定者与行动玩家 p0 都重连（质疑仍在，计时不动）；随后裁定不成立：按原剩余时间恢复
+  room.players.find(p => p.id === adjudicator).connected = true;
+  g.resumeOnReconnect(room, adjudicator);
+  room.players.find(p => p.id === 'p0').connected = true;
+  g.resumeOnReconnect(room, 'p0');
+  assert.strictEqual(room.turn.deadline, null, '质疑仍裁定时行动计时保持暂停');
+  assert.strictEqual(g.resolveChallenge(room, adjudicator, 'reject'), null);
+  assert.ok(room.turn.deadline, '裁定结束恢复倒计时');
+  const restored = room.turn.deadline - Date.now();
+  assert.ok(Math.abs(restored - savedRemaining) < 500, '裁定后恢复原剩余时间');
+  assert.ok(restored > 1000, '不会立即超时');
+  assert.ok(restored < room.ruleSet.turnSeconds * 1000 - 50000, '不是完整一回合');
+});
+
+test('重启后待裁定质疑的裁定者离线：任一合格玩家重连时移交裁定权', () => {
+  const room = makeRoom(['甲', '乙', '丙', '丁']);
+  g.endTurn(room, 'p0');
+  playOk(room, '水花'); // p1 的词
+  const node = room.nodes.find(n => n.word === '水花');
+  g.challenge(room, 'p2', node.id); // 房主 p0 裁定
+  assert.strictEqual(room.pendingChallenge.adjudicatorId, 'p0');
+
+  simulateRestartRoom(room); // 全员离线
+  // p3 重连（非质疑者、非词主）：裁定权应从离线房主移交给 p3
+  room.players.find(p => p.id === 'p3').connected = true;
+  const resumed = g.resumeOnReconnect(room, 'p3');
+  assert.strictEqual(resumed, true);
+  assert.strictEqual(room.pendingChallenge.adjudicatorId, 'p3', '裁定权移交给在线合格玩家');
+  assert.strictEqual(g.resolveChallenge(room, 'p3', 'reject'), null);
+});
+
+test('重启后质疑期间行动玩家掉线：裁定结束时保持托管暂停，重连再恢复', () => {
+  const room = makeRoom(['甲', '乙', '丙', '丁']);
+  playOk(room, '开心');
+  const node = room.nodes.find(n => n.word === '开心');
+  g.challenge(room, 'p2', node.id); // 裁定顺延给 p3（房主 p0 是词主）
+  const adjudicator = room.pendingChallenge.adjudicatorId;
+  const savedRemaining = room.turn.pausedRemaining;
+
+  simulateRestartRoom(room); // 全员离线、质疑仍在
+  // 行动玩家 p0 与裁定者 p3 都重连；但 p0 在裁定前重连，裁定结束时其在线应恢复计时
+  room.players.find(p => p.id === 'p0').connected = true;
+  g.resumeOnReconnect(room, 'p0');
+  room.players.find(p => p.id === adjudicator).connected = true;
+  g.resumeOnReconnect(room, adjudicator);
+  assert.strictEqual(g.resolveChallenge(room, adjudicator, 'reject'), null);
+  assert.ok(room.turn.deadline, '行动玩家在线：裁定后恢复倒计时');
+  assert.ok(Math.abs((room.turn.deadline - Date.now()) - savedRemaining) < 500);
+});
+
+test('裁定恢复时剩余时间已耗尽给 1 秒兜底，不立即超时', () => {
+  const room = makeRoom(['甲', '乙', '丙']);
+  playOk(room, '开心');
+  const node = room.nodes.find(n => n.word === '开心');
+  g.challenge(room, 'p1', node.id);
+  const adjudicator = room.pendingChallenge.adjudicatorId;
+  room.turn.pausedRemaining = 0; // 损坏/极端：剩余时间为 0
+  assert.strictEqual(g.resolveChallenge(room, adjudicator, 'reject'), null);
+  const restored = room.turn.deadline - Date.now();
+  assert.ok(restored >= 1000 && restored <= 1100, '给 1 秒兜底而非 0ms 立即超时');
+});
+
 
 
 test('服务器重启：旧观战者立即清出，玩家保留座位置离线', () => {

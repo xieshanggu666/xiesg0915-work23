@@ -236,17 +236,38 @@ function loadRooms() {
       if (room.phase === 'ended') room.seasonRecorded = seasonLib.isRoomRecorded(season, room);
       rooms.set(room.code, room);
       loadedRoomCodes.add(room.code);
-      // 重启后回合计时重新挂上。任何暂停态（质疑暂停 / 托管暂停）在重启后都已没有
-      // 活动连接可立刻处理：统一给一个完整回合计时，等持有资格的玩家重连后继续，
-      // 避免"deadline 为空、也没有定时器"让对局永久停住。
+      // 重启后回合计时重新挂上。关键：必须保留暂停点的剩余时间，不能把暂停中的
+      // 回合重置成完整倒计时——否则质疑裁定结束（或托管玩家重连）后，本应用剩余时间
+      // 继续的回合会凭空多出一整段时间；反过来旧 deadline 是重启前的绝对时间戳，
+      // 直接挂表又会立刻超时。这里按状态分别处理：
       if (room.phase === 'playing' && room.turn) {
-        if (!room.turn.deadline) {
-          room.turn.deadline = Date.now() + turnMs(room);
-          room.turn.pausedRemaining = null;
-          room.turn.pausedReason = null;
+        const t = room.turn;
+        if (room.pendingChallenge) {
+          // 质疑暂停中：保留/折算 pausedRemaining，不挂倒计时。
+          // 正常情况 challenge 时已停表（deadline=null）；损坏档若残留旧 deadline，
+          // 把它折算成剩余时间（过期则兜底一整回合），避免裁定一结束就立即超时。
+          if (t.deadline) {
+            const left = t.deadline - Date.now();
+            t.pausedRemaining = left > 1000 ? left : turnMs(room);
+            t.deadline = null;
+          }
+          t.pausedReason = 'challenge';
+        } else if (!t.deadline && t.pausedRemaining != null) {
+          // 托管（行动玩家掉线）暂停中：保留暂停点剩余时间、继续停表，等其重连收回。
+          t.pausedReason = t.pausedReason === 'challenge' ? 'challenge' : 'autopilot';
+        } else if (!t.deadline) {
+          // 无 deadline 也无剩余时间的损坏/旧档：给完整回合兜底，避免对局永久停住。
+          t.deadline = Date.now() + turnMs(room);
+          t.pausedRemaining = null;
+          t.pausedReason = null;
+        } else {
+          // 有 deadline：那是重启前的绝对时间戳，统一按完整回合重新挂表
+          // （正常进行中的回合，重启只损失"距上次落盘"的少量时间，可接受）。
+          t.deadline = Date.now() + turnMs(room);
         }
         scheduleTurnTimer(room);
-      }    }
+      }
+    }
     // 只恢复玩家 token；旧观战身份已随重启作废，其 token 一并丢弃，避免残留膨胀
     for (const [token, ref] of Object.entries(raw.tokens || {})) {
       if (ref && !ref.spectator && loadedRoomCodes.has(ref.roomCode)) tokens.set(token, ref);
@@ -614,8 +635,10 @@ const handlers = {
     const p = room.players.find(x => x.id === ref.playerId);
     if (!p) return sendErr(ws, '你不在该房间中', 'reconnect');
     p.connected = true;
-    // 重连立即收回托管：清托管标记；若行动玩家的倒计时正因托管暂停，这里恢复并重新挂表
-    const resumed = game.releaseAutoPilot(room, ref.playerId, { reason: 'reconnect' });
+    // 重连立即收回：兼容"直接掉线"（清 autoPilot、恢复托管暂停）与"掉线后服务器重启"
+    // （autoPilot 已被清掉，但重启保留了 pausedRemaining）两条路径——统一恢复暂停点
+    // 剩余时间、移交离线裁定者，并在需要时重新挂表。
+    const resumed = game.resumeOnReconnect(room, ref.playerId);
     if (resumed && room.turn && room.turn.playerId === ref.playerId && room.turn.deadline) {
       game.applyTurnMsOverride(room, false);
       scheduleTurnTimer(room);
