@@ -179,3 +179,22 @@ test('回放：帧不带 kind 时事件列表留空并隐藏标题（兼容旧�
   $id('replay-next').onclick();
   assert.strictEqual($id('replay-pos').textContent, '2 / 2');
 });
+
+test('回放：托管/收回/裁定移交也是可点击跳转的关键事件', () => {
+  const frames = [
+    { kind: 'create', label: '房间创建', nodes: [FIRE], turn: null },
+    { kind: 'autopilot', label: '乙 掉线，进入托管', nodes: [FIRE], turn: { playerId: 'p1', turnNumber: 2 } },
+    { kind: 'adjudicator', label: '裁定权移交给 甲', nodes: [FIRE], turn: { playerId: 'p1', turnNumber: 2 } },
+    { kind: 'resume', label: '乙 重连，收回控制权', nodes: [FIRE], turn: { playerId: 'p1', turnNumber: 2 } },
+  ];
+  recv({ type: 'replay', frames });
+  assert.deepStrictEqual(eventItems.map(li => li.dataset.idx), ['1', '2', '3']);
+  // 点「收回」跳到对应帧并展示标签
+  eventItems.find(li => li.dataset.idx === '3').onclick();
+  assert.strictEqual($id('replay-label').textContent, '乙 重连，收回控制权');
+  // 标签中文案来自 REPLAY_EVENT_KINDS（托管/收回/移交）
+  const tags = eventsEl.innerHTML.match(/<span class="ev-tag">([^<]+)<\/span>/g) || [];
+  assert.ok(tags.some(t => t.includes('托管')));
+  assert.ok(tags.some(t => t.includes('收回')));
+  assert.ok(tags.some(t => t.includes('移交')));
+});

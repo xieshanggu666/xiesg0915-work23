@@ -297,6 +297,190 @@ test('断线的观战者可恢复身份，被清出房间后需重新进入', ()
   assert.strictEqual(room.players.length, 2, '清出观战者不影响玩家');
 });
 
+// ---------- 托管 ----------
+
+test('行动玩家掉线进入托管：暂停回合计时，重连立即收回并恢复计时', () => {
+  const room = makeRoom(['甲', '乙']);
+  assert.strictEqual(activeId(room), 'p0');
+  playOk(room, '开心'); // 用掉时间无关键，关键是 deadline 在走
+  assert.ok(room.turn.deadline, '掉线前计时在走');
+  const remainBefore = room.turn.deadline - Date.now();
+
+  room.players[0].connected = false;
+  assert.strictEqual(g.enterAutoPilot(room, 'p0', 'disconnect'), true);
+  assert.strictEqual(g.isAutoPilot(room, 'p0'), true);
+  assert.strictEqual(room.turn.deadline, null, '托管暂停回合计时');
+  assert.strictEqual(room.turn.pausedReason, 'autopilot');
+  assert.ok(room.turn.pausedRemaining <= remainBefore && room.turn.pausedRemaining > 0);
+  // 幂等：重复进入不重复记日志
+  const logCount = room.log.filter(e => e.type === 'autopilot').length;
+  assert.strictEqual(g.enterAutoPilot(room, 'p0', 'disconnect'), false);
+  assert.strictEqual(room.log.filter(e => e.type === 'autopilot').length, logCount);
+
+  // 重连立即收回
+  room.players[0].connected = true;
+  assert.strictEqual(g.releaseAutoPilot(room, 'p0'), true);
+  assert.strictEqual(g.isAutoPilot(room, 'p0'), false);
+  assert.ok(room.turn.deadline, '收回后恢复倒计时');
+  assert.strictEqual(room.turn.pausedRemaining, null);
+  assert.strictEqual(room.turn.pausedReason, null);
+  // 再次收回是空操作
+  assert.strictEqual(g.releaseAutoPilot(room, 'p0'), false);
+});
+
+test('托管期间不能接词、加固、发起质疑或裁定', () => {
+  const room = makeRoom(['甲', '乙', '丙', '丁']);
+  playOk(room, '开心');
+  const node = room.nodes.find(n => n.word === '开心');
+
+  // 行动玩家 p0 托管：不能行动
+  room.players[0].connected = false;
+  g.enterAutoPilot(room, 'p0', 'disconnect');
+  assert.match(g.playWord(room, 'p0', { word: '高兴', parentId: 'start0',
+    relation: 'synonym', reason: '合理的解释长度' }), /托管/);
+  assert.match(g.reinforce(room, 'p0', node.id), /托管/);
+
+  // 非行动玩家 p1 托管：不能发起质疑
+  g.enterAutoPilot(room, 'p1', 'timeout');
+  assert.match(g.challenge(room, 'p1', node.id), /托管/);
+  assert.strictEqual(room.pendingChallenge, null, '托管玩家的质疑不成立');
+
+  // 在线非托管玩家 p2 质疑 p0 的词；房主 p0 离线托管，裁定顺延给在线非托管的 p3
+  assert.strictEqual(g.challenge(room, 'p2', node.id), null);
+  assert.strictEqual(room.pendingChallenge.adjudicatorId, 'p3');
+  // 裁定者 p3 掉线托管 → 裁定权移交（合格人选：p1 虽在线但超时托管，排除 → 无人，
+  // 因此这里先让 p1 收回，确保有合格的在线非托管人选可移交）
+  g.releaseAutoPilot(room, 'p1', { reason: 'reconnect' });
+  room.players.find(p => p.id === 'p3').connected = false;
+  g.enterAutoPilot(room, 'p3', 'disconnect');
+  assert.strictEqual(room.pendingChallenge.adjudicatorId, 'p1', '裁定权移交给在线非托管的 p1');
+  // 已移交的原裁定者 p3 处于托管，不能再裁定（托管守门先于身份判定）
+  assert.match(g.resolveChallenge(room, 'p3', 'uphold'), /托管|只有裁定者/);
+  assert.strictEqual(g.resolveChallenge(room, 'p1', 'reject'), null);
+});
+
+test('托管玩家不会被选为裁定者（即便仍在线的超时托管）', () => {
+  const room = makeRoom(['甲', '乙', '丙', '丁']);
+  g.endTurn(room, 'p0');
+  playOk(room, '水花'); // p1 的词
+  const node = room.nodes.find(n => n.word === '水花');
+  // 房主 p0 与 p3 是仅有的非词主/非质疑者候选；让 p0 在线、p3 在线但超时托管
+  g.enterAutoPilot(room, 'p3', 'timeout');
+  assert.strictEqual(g.challenge(room, 'p2', node.id), null);
+  assert.strictEqual(room.pendingChallenge.adjudicatorId, 'p0', '在线房主优先于托管的 p3');
+  g.resolveChallenge(room, 'p0', 'reject');
+
+  // 房主掉线托管，p3 仍在线但超时托管：p2 质疑、p1 词主 → 无合格裁定者 → 拒绝
+  room.players.find(p => p.id === 'p0').connected = false;
+  g.enterAutoPilot(room, 'p0', 'disconnect');
+  const tokensBefore = room.players[2].tokensLeft;
+  const err = g.challenge(room, 'p2', node.id);
+  assert.match(err, /裁定/);
+  assert.strictEqual(room.pendingChallenge, null);
+  assert.strictEqual(room.players[2].tokensLeft, tokensBefore, '无人裁定不扣次数');
+  // p3 收回后（仍非质疑者/词主）即可承担裁定
+  g.releaseAutoPilot(room, 'p3', { reason: 'reconnect' });
+  assert.strictEqual(g.challenge(room, 'p2', node.id), null);
+  assert.strictEqual(room.pendingChallenge.adjudicatorId, 'p3');
+});
+
+test('轮到仍离线的托管玩家：托管代为空过该回合（不挂计时）', () => {
+  const room = makeRoom(['甲', '乙']);
+  // p0 正常结束回合；轮到 p1 前让 p1 掉线托管
+  room.players[1].connected = false;
+  g.enterAutoPilot(room, 'p1', 'disconnect');
+  assert.strictEqual(g.endTurn(room, 'p0'), null);
+  // 应直接跳过 p1，回到 p0
+  assert.strictEqual(activeId(room), 'p0');
+  assert.strictEqual(room.turn.turnNumber, 3, 'p1 的回合已被代过');
+  // p1 重连不再影响已跳过的回合，之后正常轮到
+  room.players[1].connected = true;
+  g.releaseAutoPilot(room, 'p1');
+  assert.strictEqual(g.endTurn(room, 'p0'), null);
+  assert.strictEqual(activeId(room), 'p1');
+  assert.ok(room.turn.deadline, '重连后轮到 p1 时有正常倒计时');
+});
+
+test('在线的超时托管玩家轮到自己时自动收回控制权', () => {
+  const room = makeRoom(['甲', '乙']);
+  // p0 回合超时：进入托管并代为结束
+  g.enterAutoPilot(room, 'p0', 'timeout');
+  assert.strictEqual(g.endTurn(room, 'p0', { auto: true, reason: 'timeout' }), null);
+  assert.strictEqual(activeId(room), 'p1');
+  // p1 立刻空过，回到 p0：p0 仍在线，beginTurn 应自动收回
+  assert.strictEqual(g.endTurn(room, 'p1'), null);
+  assert.strictEqual(activeId(room), 'p0');
+  assert.strictEqual(g.isAutoPilot(room, 'p0'), false, '轮到自己自动收回');
+  assert.ok(room.turn.deadline);
+  assert.ok(room.log.some(e => e.type === 'resume' && e.playerId === 'p0' && e.reason === 'turn'));
+});
+
+test('质疑暂停与托管暂停叠加：质疑结束后行动玩家仍托管则保持暂停', () => {
+  const room = makeRoom(['甲', '乙', '丙', '丁', '戊']);
+  playOk(room, '开心');
+  const node = room.nodes.find(n => n.word === '开心');
+  // 房主 p0 是词主，裁定顺延；先让 p1 超时托管（仍在线），合格裁定者应跳过 p1 选 p3
+  g.enterAutoPilot(room, 'p1', 'timeout');
+  assert.strictEqual(g.challenge(room, 'p2', node.id), null);
+  assert.strictEqual(room.pendingChallenge.adjudicatorId, 'p3');
+  assert.strictEqual(room.turn.pausedReason, 'challenge');
+  // 行动玩家 p0 此时掉线托管：质疑暂停中的剩余时间不被覆盖
+  room.players[0].connected = false;
+  g.enterAutoPilot(room, 'p0', 'disconnect');
+  assert.strictEqual(room.turn.pausedReason, 'challenge', '质疑暂停优先，不被托管覆盖');
+  // p3 裁定不成立：行动玩家仍托管 → 不恢复倒计时，转为托管暂停
+  assert.strictEqual(g.resolveChallenge(room, 'p3', 'reject'), null);
+  assert.strictEqual(room.turn.deadline, null, '托管中的行动玩家在质疑后仍暂停');
+  assert.strictEqual(room.turn.pausedReason, 'autopilot');
+  // 重连收回 → 恢复
+  room.players[0].connected = true;
+  g.releaseAutoPilot(room, 'p0');
+  assert.ok(room.turn.deadline);
+});
+
+test('托管的进入/收回/代为结束/移交都写入回放日志并生成可读帧', () => {
+  const room = makeRoom(['甲', '乙', '丙', '丁', '戊']);
+  playOk(room, '开心');
+  const node = room.nodes.find(n => n.word === '开心');
+  // 行动玩家 p0（房主、词主）掉线托管（含托管进入帧）；p1 也超时托管（仍在线）。
+  // p2 质疑时，合格裁定者跳过离线房主与托管的 p1，顺延给 p3。
+  room.players[0].connected = false;
+  g.enterAutoPilot(room, 'p0', 'disconnect');
+  g.enterAutoPilot(room, 'p1', 'timeout');
+  assert.strictEqual(g.challenge(room, 'p2', node.id), null);
+  assert.strictEqual(room.pendingChallenge.adjudicatorId, 'p3');
+  // p3 掉线托管 → 裁定权移交 p4（在线、非质疑者、非词主、非托管）
+  room.players.find(p => p.id === 'p3').connected = false;
+  g.enterAutoPilot(room, 'p3', 'disconnect');
+  assert.strictEqual(room.pendingChallenge.adjudicatorId, 'p4');
+  assert.strictEqual(g.resolveChallenge(room, 'p4', 'reject'), null);
+  // 重连所有托管玩家，行动玩家 p0 收回控制权并恢复计时
+  for (const pid of ['p0', 'p1', 'p3']) {
+    room.players.find(p => p.id === pid).connected = true;
+    g.releaseAutoPilot(room, pid);
+  }
+  while (room.phase === 'playing') g.endTurn(room, activeId(room), { auto: true });
+
+  const frames = g.buildReplay(room);
+  const kinds = frames.map(f => f.kind);
+  assert.ok(kinds.includes('autopilot'), '回放含托管帧');
+  assert.ok(kinds.includes('resume'), '回放含收回帧');
+  assert.ok(kinds.includes('adjudicator'), '回放含裁定移交帧');
+  assert.match(frames.find(f => f.kind === 'autopilot').label, /进入托管/);
+  assert.match(frames.find(f => f.kind === 'resume').label, /收回控制权/);
+  assert.match(frames.find(f => f.kind === 'adjudicator').label, /裁定权移交/);
+});
+
+test('公开视图暴露 autoPilot 标记', () => {
+  const room = makeRoom(['甲', '乙']);
+  g.enterAutoPilot(room, 'p1', 'timeout');
+  const view = g.publicView(room, 'p0');
+  assert.strictEqual(view.players.find(p => p.id === 'p1').autoPilot, true);
+  assert.strictEqual(view.players.find(p => p.id === 'p0').autoPilot, false);
+});
+
+
+
 test('服务器重启：旧观战者立即清出，玩家保留座位置离线', () => {
   const room = makeRoom(['甲', '乙']);
   // 占满观战名额（重启前都在线）

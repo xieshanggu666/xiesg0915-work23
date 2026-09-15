@@ -178,6 +178,12 @@
   // 避免在旧局面上重复提交（恢复成功的瞬间状态已刷新，不锁定）。
   const roomOffline = () => !!state &&
     (connStatus === 'reconnecting' || connStatus === 'recovering' || connStatus === 'failed');
+  // 我是否正被系统托管（掉线/超时）：托管期间服务端会拒绝一切行动/质疑/裁定，
+  // 界面也相应禁用，避免提交后只收到一条错误。
+  const meAutoPilot = () => {
+    const me = state && state.players.find(p => p.id === state.you);
+    return !!state && !!me && !!me.autoPilot;
+  };
 
   function handle(msg) {
     switch (msg.type) {
@@ -906,7 +912,8 @@
     const spectator = !!state.spectating;
     const active = !spectator && t && t.playerId === state.you;
     $('turn-info').innerHTML = t
-      ? `第 ${t.turnNumber} 回合 · 轮到 <b style="color:${playerColor(state, t.playerId)}">${esc(playerName(state, t.playerId))}</b>${active ? '（你）' : ''}`
+      ? `第 ${t.turnNumber} 回合 · 轮到 <b style="color:${playerColor(state, t.playerId)}">${esc(playerName(state, t.playerId))}</b>${active ? '（你）' : ''}` +
+        ((state.players.find(p => p.id === t.playerId) || {}).autoPilot ? '<span class="autopilot">托管中</span>' : '')
       : '';
     $('ap-info').textContent = spectator
       ? '观战中 · 只读'
@@ -918,9 +925,12 @@
 
     $('scoreboard').innerHTML = state.players.map(p => {
       const words = state.nodes.filter(n => n.ownerId === p.id).length;
+      const status = p.autoPilot
+        ? '<span class="autopilot">托管</span>'
+        : (p.connected ? '' : '<span class="offline">离线</span>');
       return `<span class="score-chip ${t && t.playerId === p.id ? 'active' : ''}">
         <span class="dot" style="background:${p.color}"></span>${esc(p.name)} · ${words} 词
-        ${p.connected ? '' : '<span class="offline">离线</span>'}</span>`;
+        ${status}</span>`;
     }).join('') + ((state.spectators || []).length
       ? `<span class="score-chip spec">👁 ${state.spectators.length} 人观战</span>` : '');
 
@@ -944,7 +954,7 @@
 
     renderBoard($('board'), state.nodes, {
       selectable: active,
-      showChallenge: !active && !spectator && state.phase === 'playing',
+      showChallenge: !active && !spectator && state.phase === 'playing' && !meAutoPilot(),
     });
 
     // 观战者：隐藏全部行动按钮，词链不可选
@@ -952,10 +962,11 @@
     // 断线重连/恢复中：行动按钮禁用，防止在旧局面上重复提交。
     // 注意 recovered 横幅展示期间操作已可用（此时状态就是刚同步的最新状态）。
     const offline = roomOffline();
-    $('btn-play').disabled = !active || !selectedParent || (t && t.apLeft < 1) || !!state.pendingChallenge || offline;
-    $('btn-reinforce').disabled = !active || (t && t.apLeft < 1) || !!state.pendingChallenge || offline;
+    const pilot = meAutoPilot();
+    $('btn-play').disabled = !active || !selectedParent || (t && t.apLeft < 1) || !!state.pendingChallenge || offline || pilot;
+    $('btn-reinforce').disabled = !active || (t && t.apLeft < 1) || !!state.pendingChallenge || offline || pilot;
     $('btn-reinforce').textContent = reinforceMode ? '取消加固' : '加固';
-    $('btn-endturn').disabled = !active || !!state.pendingChallenge || offline;
+    $('btn-endturn').disabled = !active || !!state.pendingChallenge || offline || pilot;
     $('btn-replay').classList.add('hidden');
 
     updateTimer();
@@ -1063,10 +1074,16 @@
       else if (t.pausedRemaining != null) remain = t.pausedRemaining;
       else return;
       const total = state.ruleSet.turnSeconds * 1000;
-      const pct = Math.min(100, remain / total * 100);
-      $('timer-bar').style.width = pct + '%';
+      const pct = Math.min(100, remain / total * 1000);
+      $('timer-bar').style.width = (Math.min(100, remain / total * 100)) + '%';
       $('timer-bar').classList.toggle('low', remain < 15000);
-      $('timer-text').textContent = t.deadline ? `${Math.ceil(remain / 1000)}s` : '裁定中…';
+      if (t.deadline) {
+        $('timer-text').textContent = `${Math.ceil(remain / 1000)}s`;
+      } else if (t.pausedReason === 'autopilot') {
+        $('timer-text').textContent = '托管中…';
+      } else {
+        $('timer-text').textContent = '裁定中…';
+      }
     };
     tick();
     timerInterval = setInterval(tick, 500);
@@ -1186,6 +1203,9 @@
     challenge: '质疑',
     demolish: '拆除',
     reinforce: '加固',
+    autopilot: '托管',
+    resume: '收回',
+    adjudicator: '移交',
     end: '结算',
   };
 

@@ -225,6 +225,9 @@ function loadRooms() {
       // 也不能虚占在线名额让新观战者撞上"已满"。想继续看的人重新输入房间码即可。
       game.resetConnectionsAfterRestart(room);
       game.removeAllSpectators(room);
+      // 托管是"本次在线会话"的临时处置（掉线即托管、重连即收回），不落盘、不跨重启：
+      // 重启后所有玩家一律按普通离线处理，凭 token 重连恢复；残留的 autoPilot 标记清掉。
+      room.players.forEach(p => { p.autoPilot = false; });
       // 赛季是否已计入，只认赛季档案自己的逐局索引：
       //  - 索引里有：说明玩家汇总确实已落盘，补上内存标记，重连结算房时不重复累计；
       //  - 索引里没有：这局可能是"内存计过但赛季没落盘"（如防抖窗口内被杀），
@@ -233,16 +236,17 @@ function loadRooms() {
       if (room.phase === 'ended') room.seasonRecorded = seasonLib.isRoomRecorded(season, room);
       rooms.set(room.code, room);
       loadedRoomCodes.add(room.code);
-      // 重启后回合计时重新挂上
+      // 重启后回合计时重新挂上。任何暂停态（质疑暂停 / 托管暂停）在重启后都已没有
+      // 活动连接可立刻处理：统一给一个完整回合计时，等持有资格的玩家重连后继续，
+      // 避免"deadline 为空、也没有定时器"让对局永久停住。
       if (room.phase === 'playing' && room.turn) {
-        if (room.turn.deadline) {
-          room.turn.deadline = Date.now() + room.ruleSet.turnSeconds * 1000;
-        } else if (room.turn.pausedRemaining == null) {
-          room.turn.deadline = Date.now() + room.ruleSet.turnSeconds * 1000;
+        if (!room.turn.deadline) {
+          room.turn.deadline = Date.now() + turnMs(room);
+          room.turn.pausedRemaining = null;
+          room.turn.pausedReason = null;
         }
         scheduleTurnTimer(room);
-      }
-    }
+      }    }
     // 只恢复玩家 token；旧观战身份已随重启作废，其 token 一并丢弃，避免残留膨胀
     for (const [token, ref] of Object.entries(raw.tokens || {})) {
       if (ref && !ref.spectator && loadedRoomCodes.has(ref.roomCode)) tokens.set(token, ref);
@@ -411,15 +415,31 @@ function sendTo(playerId, msg) {
 
 // ---------- 回合计时 ----------
 
+// 当前房间一个回合的计时长度（毫秒）。默认取开局规则 turnSeconds；
+// _turnMsOverride 仅供自包含冒烟测试压短超时（不随 ruleSet 广播、不落客户端规则）。
+function turnMs(room) {
+  return Number.isFinite(room._turnMsOverride) && room._turnMsOverride > 0
+    ? room._turnMsOverride
+    : room.ruleSet.turnSeconds * 1000;
+}
+
 const turnTimers = new Map();
 function scheduleTurnTimer(room) {
   clearTimeout(turnTimers.get(room.code));
   if (room.phase !== 'playing' || !room.turn || !room.turn.deadline) return;
   const delay = Math.max(0, room.turn.deadline - Date.now());
   turnTimers.set(room.code, setTimeout(() => {
-    if (room.phase !== 'playing' || !room.turn) return;
-    const err = game.endTurn(room, room.turn.playerId, { auto: true });
-    if (!err) { scheduleTurnTimer(room); broadcast(room); }
+    if (room.phase !== 'playing' || !room.turn || room.pendingChallenge) return;
+    const playerId = room.turn.playerId;
+    // 超时：先进入托管（写入回放），再由托管代为结束回合（advanceTurn 会自动空过
+    // 后续仍离线的托管玩家）。此时玩家通常仍连着线（挂机），托管持续到其重连或下个回合。
+    game.enterAutoPilot(room, playerId, 'timeout');
+    const err = game.endTurn(room, playerId, { auto: true, reason: 'timeout' });
+    if (!err) {
+      game.applyTurnMsOverride(room); // 新回合同样套用测试短计时（生产为空操作）
+      scheduleTurnTimer(room);
+      broadcast(room);
+    }
   }, delay + 50));
 }
 
@@ -502,6 +522,11 @@ function detachSocket(playerId, ws) {
       const p = room.players.find(x => x.id === playerId);
       if (p && p.connected) {
         p.connected = false;
+        // 掉线即进入托管：行动玩家暂停回合计时、裁定者移交裁定权、托管期间不质疑不裁定。
+        game.enterAutoPilot(room, playerId, 'disconnect');
+        if (room.turn && room.turn.playerId === playerId && !room.turn.deadline) {
+          clearTimeout(turnTimers.get(room.code)); // 行动玩家的倒计时已暂停
+        }
         game.ensureAdjudicatorOnline(room);
         broadcast(room);
       }
@@ -589,6 +614,12 @@ const handlers = {
     const p = room.players.find(x => x.id === ref.playerId);
     if (!p) return sendErr(ws, '你不在该房间中', 'reconnect');
     p.connected = true;
+    // 重连立即收回托管：清托管标记；若行动玩家的倒计时正因托管暂停，这里恢复并重新挂表
+    const resumed = game.releaseAutoPilot(room, ref.playerId, { reason: 'reconnect' });
+    if (resumed && room.turn && room.turn.playerId === ref.playerId && room.turn.deadline) {
+      game.applyTurnMsOverride(room, false);
+      scheduleTurnTimer(room);
+    }
     ctx.playerId = ref.playerId; ctx.roomCode = room.code;
     attachSocket(ref.playerId, ws);
     ws.send(JSON.stringify({ type: 'joined', token: msg.token,
@@ -606,12 +637,16 @@ const handlers = {
     }
   },
 
-  setRules(ws, ctx, msg) {
+    setRules(ws, ctx, msg) {
     const room = ctxRoom(ctx);
     // 客户端会等待明确答复后才解除提交锁定，任何情况都要给出回应
     if (!room) return sendErr(ws, '房间已不存在', 'setRules');
     const err = game.setRuleSet(room, ctx.playerId, msg.ruleSet || {});
     if (err) return sendErr(ws, err, 'setRules');
+    // 仅供自包含端到端冒烟使用的回合计时覆盖（毫秒）：不走 ruleSet、不影响界面规则，
+    // 让"超时托管"用例如 80ms 完成，而不必等最短 30 秒。非有限正数一律忽略。
+    const ov = msg.ruleSet && msg.ruleSet.__turnMsOverride;
+    if (Number.isFinite(ov) && ov > 0) room._turnMsOverride = Math.max(20, Math.trunc(ov));
     // 明确告知保存方成功，客户端据此关闭编辑器并给出反馈
     if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'rulesSaved' }));
     broadcast(room);
@@ -757,6 +792,7 @@ const handlers = {
     if (!room) return;
     const err = game.startGame(room, ctx.playerId);
     if (err) return sendErr(ws, err);
+    game.applyTurnMsOverride(room); // 测试用短计时覆盖（生产房间为空操作）
     scheduleTurnTimer(room);
     broadcast(room);
   },
@@ -782,6 +818,7 @@ const handlers = {
     if (!room) return;
     const err = game.endTurn(room, ctx.playerId);
     if (err) return sendErr(ws, err);
+    game.applyTurnMsOverride(room);
     scheduleTurnTimer(room);
     broadcast(room);
   },
@@ -800,6 +837,7 @@ const handlers = {
     if (!room) return;
     const err = game.resolveChallenge(room, ctx.playerId, msg.verdict);
     if (err) return sendErr(ws, err);
+    game.applyTurnMsOverride(room, false);
     scheduleTurnTimer(room); // 恢复计时
     broadcast(room);
   },

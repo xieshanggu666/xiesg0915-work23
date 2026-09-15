@@ -49,7 +49,7 @@ function newRoom(code, hostId, hostName) {
     hostId,
     phase: 'lobby', // lobby | playing | ended
     ruleSet: { ...DEFAULT_RULESET },
-    players: [],    // {id,name,color,connected,tokensLeft}
+    players: [],    // {id,name,color,connected,tokensLeft,autoPilot}
     spectators: [], // {id,name,connected} 只读观战者，不参与对局
     // 主题词包快照：房主在大厅从自己的本机词包中选用，内容随房间状态广播，
     // 所有玩家开局前都能看到主题与候选词；null 表示使用内置默认词池。
@@ -74,6 +74,7 @@ function addPlayer(room, id, name, pid = null) {
   room.players.push({
     id, name: String(name || '玩家').slice(0, 12), color,
     connected: true, tokensLeft: room.ruleSet.challengeTokens,
+    autoPilot: false, // 掉线/超时后进入托管：不发起质疑、不接受裁定指派，重连立即收回
     pid: /^[a-f0-9]{64}$/.test(pid) ? pid : null,
   });
   logEvent(room, 'join', { playerId: id, name });
@@ -227,9 +228,72 @@ function beginTurn(room, playerIdx) {
     apLeft: room.ruleSet.apPerTurn,
     deadline: Date.now() + room.ruleSet.turnSeconds * 1000,
     pausedRemaining: null,
+    pausedReason: null, // 'challenge' | 'autopilot'，区分质疑暂停与托管暂停
   };
   logEvent(room, 'turn', { playerId: player.id, turnNumber: room.turn.turnNumber,
     apLeft: room.turn.apLeft });
+  // 在线（但上一回合超时挂起）的玩家轮到自己时自动收回控制权；仍离线的托管玩家
+  // 由托管代为空过本回合（不挂倒计时），避免无人在线的对局空等一个完整回合计时。
+  // 有待裁定质疑时计时本就暂停，不跳过回合（理论上质疑解决后才会推进到下一回合）。
+  if (player.autoPilot && !room.pendingChallenge) {
+    if (player.connected) {
+      releaseAutoPilot(room, player.id, { reason: 'turn' });
+    } else {
+      logEvent(room, 'endTurn', { playerId: player.id, auto: true, reason: 'autopilot' });
+      advanceTurn(room);
+    }
+  }
+}
+
+// ---------- 托管 ----------
+
+function isAutoPilot(room, playerId) {
+  const p = room.players.find(x => x.id === playerId);
+  return !!(p && p.autoPilot);
+}
+
+// 玩家进入托管：掉线（reason:'disconnect'）或回合超时（reason:'timeout'）。
+// - 若正好是行动玩家：暂停回合计时（质疑暂停优先，不覆盖质疑剩余时间），等其重连；
+// - 若是当前待裁定质疑的裁定者：立即把裁定权移交给在线的合格玩家；
+// - 托管期间不发起质疑、也不被指派为裁定者（见 challenge / pickAdjudicator）。
+// 幂等：重复进入（同一玩家多连接逐个断开）不重复记日志、不重复移交。
+function enterAutoPilot(room, playerId, reason = 'disconnect') {
+  if (room.phase !== 'playing') return false;
+  const p = room.players.find(x => x.id === playerId);
+  if (!p) return false;
+  const wasAuto = !!p.autoPilot;
+  p.autoPilot = true;
+  if (!wasAuto) {
+    logEvent(room, 'autopilot', { playerId, reason });
+  }
+  // 行动玩家：暂停本回合倒计时（质疑暂停中的剩余时间归质疑所有，不动）
+  if (room.turn && room.turn.playerId === playerId && room.turn.deadline) {
+    room.turn.pausedRemaining = Math.max(0, room.turn.deadline - Date.now());
+    room.turn.deadline = null;
+    room.turn.pausedReason = 'autopilot';
+  }
+  // 裁定者：移交裁定权（内部仅在该玩家确为裁定者且离线/无资格时才换）
+  ensureAdjudicatorOnline(room);
+  return !wasAuto;
+}
+
+// 重连（或在线玩家轮到自己）时立即收回控制权：清托管标记；若当前是行动玩家且计时
+// 正因"托管"暂停而停住，恢复倒计时。质疑暂停（pausedReason='challenge'）不恢复。
+function releaseAutoPilot(room, playerId, { reason = 'reconnect' } = {}) {
+  const p = room.players.find(x => x.id === playerId);
+  if (!p || !p.autoPilot) return false;
+  p.autoPilot = false;
+  logEvent(room, 'resume', { playerId, reason });
+  // 行动玩家收回：若无待裁定质疑且计时正停着，恢复倒计时；
+  // 质疑仍在裁定时保持质疑暂停，待裁定结束后恢复。
+  if (room.turn && room.turn.playerId === playerId &&
+      !room.turn.deadline && room.turn.pausedRemaining != null &&
+      !room.pendingChallenge) {
+    room.turn.deadline = Date.now() + room.turn.pausedRemaining;
+    room.turn.pausedRemaining = null;
+    room.turn.pausedReason = null;
+  }
+  return true;
 }
 
 // ---------- 行动 ----------
@@ -241,6 +305,7 @@ function isActivePlayer(room, playerId) {
 function playWord(room, playerId, { word, parentId, relation, reason }) {
   if (isSpectator(room, playerId)) return '观战者不能参与对局';
   if (!isActivePlayer(room, playerId)) return '还没轮到你';
+  if (isAutoPilot(room, playerId)) return '你正处于托管中，重连后即可操作';
   if (room.pendingChallenge) return '有质疑正在裁定，请稍候';
   if (room.turn.apLeft < 1) return '行动点不足';
   word = String(word || '').trim();
@@ -267,6 +332,7 @@ function playWord(room, playerId, { word, parentId, relation, reason }) {
 function reinforce(room, playerId, nodeId) {
   if (isSpectator(room, playerId)) return '观战者不能参与对局';
   if (!isActivePlayer(room, playerId)) return '还没轮到你';
+  if (isAutoPilot(room, playerId)) return '你正处于托管中，重连后即可操作';
   if (room.pendingChallenge) return '有质疑正在裁定，请稍候';
   if (room.turn.apLeft < 1) return '行动点不足';
   const node = room.nodes.find(n => n.id === nodeId);
@@ -280,11 +346,14 @@ function reinforce(room, playerId, nodeId) {
   return null;
 }
 
-function endTurn(room, playerId, { auto = false } = {}) {
+function endTurn(room, playerId, { auto = false, reason = null } = {}) {
   if (isSpectator(room, playerId)) return '观战者不能参与对局';
   if (!isActivePlayer(room, playerId)) return '还没轮到你';
   if (room.pendingChallenge) return '有质疑正在裁定';
-  logEvent(room, 'endTurn', { playerId, auto });
+  // 托管期间玩家不能手动结束回合；但托管代为结束（超时 auto，或轮到仍离线者由
+  // beginTurn 内部跳过）必须放行，否则无人在线的对局无法推进。
+  if (isAutoPilot(room, playerId) && !auto) return '你正处于托管中，重连后即可操作';
+  logEvent(room, 'endTurn', { playerId, auto, reason });
   advanceTurn(room);
   return null;
 }
@@ -312,20 +381,22 @@ function finishGame(room) {
 
 // ---------- 质疑与裁定 ----------
 
-// 挑选裁定者：房主优先，但必须在线——离线房主无法裁定，质疑会把对局卡住。
-// 涉及房主的词、或房主离线时，顺延给既不是词主也不是质疑者的在线玩家；
-// 实在没有合格人选时兜底归房主（可能离线，由调用方决定是否拒绝这次质疑）。
+// 挑选裁定者：房主优先，但必须在线且未托管——离线/托管的房主无法裁定，质疑会把对局卡住。
+// 涉及房主的词、或房主离线/托管时，顺延给既不是词主也不是质疑者的在线、非托管玩家；
+// 实在没有合格人选时兜底归房主（可能离线/托管，由调用方决定是否拒绝这次质疑）。
 function pickAdjudicator(room, node, challengerId) {
+  const eligible = p => p.connected && !p.autoPilot &&
+    p.id !== node.ownerId && p.id !== challengerId;
   const host = room.players.find(p => p.id === room.hostId);
-  if (host && host.connected && node.ownerId !== room.hostId) return room.hostId;
-  const other = room.players.find(p =>
-    p.connected && p.id !== node.ownerId && p.id !== challengerId);
+  if (host && eligible(host)) return room.hostId;
+  const other = room.players.find(eligible);
   return other ? other.id : room.hostId;
 }
 
 function challenge(room, playerId, nodeId) {
   if (room.phase !== 'playing') return '游戏未在进行中';
   if (isSpectator(room, playerId)) return '观战者不能发起质疑';
+  if (isAutoPilot(room, playerId)) return '你正处于托管中，重连后才能发起质疑';
   if (room.pendingChallenge) return '已有质疑正在裁定';
   if (isActivePlayer(room, playerId)) return '自己的回合不能发起质疑';
   const player = room.players.find(p => p.id === playerId);
@@ -336,17 +407,20 @@ function challenge(room, playerId, nodeId) {
   if (node.ownerId === playerId) return '不能质疑自己的词';
   if (node.reinforced) return '加固过的连接免疫质疑';
   const adjudicator = pickAdjudicator(room, node, playerId);
-  // 没有在线裁定者时直接拒绝：不扣次数、不暂停计时——否则质疑无人裁定会卡住整局
-  const adjOnline = room.players.some(p => p.id === adjudicator && p.connected);
-  if (!adjOnline) return '暂时没有在线的玩家可以裁定，无法发起质疑';
+  // 没有在线、非托管裁定者时直接拒绝：不扣次数、不暂停计时——否则质疑无人裁定会卡住整局
+  const adj = room.players.find(p => p.id === adjudicator);
+  if (!adj || !adj.connected || adj.autoPilot) {
+    return '暂时没有在线的玩家可以裁定，无法发起质疑';
+  }
   player.tokensLeft -= 1;
   room.pendingChallenge = {
     id: uid('c'), nodeId, challengerId: playerId, adjudicatorId: adjudicator,
   };
-  // 暂停回合计时
+  // 暂停回合计时（托管暂停已经把倒计时停住时不覆盖：质疑结束后仍归托管暂停）
   if (room.turn && room.turn.deadline) {
     room.turn.pausedRemaining = Math.max(0, room.turn.deadline - Date.now());
     room.turn.deadline = null;
+    room.turn.pausedReason = 'challenge';
   }
   logEvent(room, 'challenge', { challengeId: room.pendingChallenge.id, nodeId,
     challengerId: playerId, adjudicatorId: adjudicator, tokensLeft: player.tokensLeft });
@@ -357,6 +431,7 @@ function resolveChallenge(room, playerId, verdict) {
   const ch = room.pendingChallenge;
   if (!ch) return '没有待裁定的质疑';
   if (isSpectator(room, playerId)) return '观战者不能参与裁定';
+  if (isAutoPilot(room, playerId)) return '你正处于托管中，不能代为裁定';
   if (ch.adjudicatorId !== playerId) return '只有裁定者可以判定';
   if (verdict !== 'uphold' && verdict !== 'reject') return '无效的裁定';
   const node = room.nodes.find(n => n.id === ch.nodeId);
@@ -366,9 +441,17 @@ function resolveChallenge(room, playerId, verdict) {
     cascadeRemove(room, node.id, removed);
   }
   room.pendingChallenge = null;
-  if (room.turn && room.turn.pausedRemaining != null) {
+  // 恢复计时：仅当初是被"质疑"暂停、且行动玩家当前不在托管时才恢复。
+  // 行动玩家可能在质疑期间掉线托管（此时暂停原因仍标记为 challenge），
+  // 质疑结束后应转为托管暂停继续停表，等其重连收回时再恢复。
+  const activePlayer = room.turn && room.players.find(p => p.id === room.turn.playerId);
+  const activeAuto = !!activePlayer && activePlayer.autoPilot;
+  if (room.turn && room.turn.pausedRemaining != null && !activeAuto) {
     room.turn.deadline = Date.now() + room.turn.pausedRemaining;
     room.turn.pausedRemaining = null;
+    room.turn.pausedReason = null;
+  } else if (room.turn && activeAuto && room.turn.pausedRemaining != null) {
+    room.turn.pausedReason = 'autopilot';
   }
   logEvent(room, 'resolve', { challengeId: ch.id, verdict,
     removed: removed.map(n => n.id) });
@@ -390,15 +473,17 @@ function cascadeRemove(room, nodeId, removed) {
   }
 }
 
-// 裁定者掉线时，把裁定权移交给在线的合格玩家，避免对局卡死
+// 裁定者掉线/进入托管时，把裁定权移交给在线且非托管的合格玩家，避免对局卡死。
+// 托管（含超时挂起）期间不接受裁定指派，即便该玩家仍连着线也一样顺延。
 function ensureAdjudicatorOnline(room) {
   const ch = room.pendingChallenge;
   if (!ch) return false;
   const adj = room.players.find(p => p.id === ch.adjudicatorId);
-  if (adj && adj.connected) return false;
+  if (adj && adj.connected && !adj.autoPilot) return false;
   const node = room.nodes.find(n => n.id === ch.nodeId);
   const candidate = room.players.find(p =>
-    p.connected && p.id !== ch.challengerId && (!node || p.id !== node.ownerId));
+    p.connected && !p.autoPilot &&
+    p.id !== ch.challengerId && (!node || p.id !== node.ownerId));
   if (!candidate) return false;
   ch.adjudicatorId = candidate.id;
   logEvent(room, 'adjudicator', { challengeId: ch.id, adjudicatorId: candidate.id });
@@ -502,6 +587,18 @@ function pruneExpiredRooms(rooms, ttlMs, now = Date.now()) {
   return removed;
 }
 
+// 仅供自包含端到端冒烟使用：用房间上的 _turnMsOverride 校正当前新回合的 deadline。
+// fresh=true 仅在新回合（开局/结束回合/超时推进）时把 deadline 重置为覆盖时长；
+// fresh=false（重连/裁定后恢复计时）保留暂停点的剩余时间，只在没有 deadline 时兜底。
+// 生产房间没有该字段，函数为空操作（仍以 ruleSet.turnSeconds 为准）。
+function applyTurnMsOverride(room, fresh = true) {
+  const ms = room && room._turnMsOverride;
+  if (room.phase !== 'playing' || !room.turn || !(Number.isFinite(ms) && ms > 0)) return;
+  if (fresh || !room.turn.deadline) {
+    room.turn.deadline = Date.now() + Math.max(20, Math.trunc(ms));
+  }
+}
+
 // 由事件日志重建每一步的盘面快照，供回放使用。
 // 每帧带语义化的 kind，客户端据此把关键事件（质疑/拆除/加固/结算）标出来供跳转。
 function buildReplay(room) {
@@ -559,6 +656,30 @@ function buildReplay(room) {
         }
         break;
       }
+      case 'endTurn':
+        // 托管代为空过单独成帧（含离线轮到自己与超时代结），普通手动结束回合不打断回放
+        if (ev.auto && ev.reason === 'autopilot') {
+          kind = 'autopilot';
+          label = `${playerName(ev.playerId)} 离线托管，代为结束回合`;
+        } else {
+          label = null;
+        }
+        break;
+      case 'autopilot': {
+        kind = 'autopilot';
+        const why = ev.reason === 'timeout' ? '回合超时' : '掉线';
+        label = `${playerName(ev.playerId)} ${why}，进入托管`;
+        break;
+      }
+      case 'resume': {
+        kind = 'resume';
+        const how = ev.reason === 'turn' ? '轮到自己' : '重连';
+        label = `${playerName(ev.playerId)} ${how}，收回控制权`;
+        break;
+      }
+      case 'adjudicator':
+        label = `裁定权移交给 ${playerName(ev.adjudicatorId)}`;
+        break;
       case 'end':
         snap.scores = ev.scores;
         label = '游戏结束，结算';
@@ -583,7 +704,7 @@ function publicView(room, forPlayerId) {
     ruleSet: room.ruleSet,
     wordPack: room.wordPack || null,
     players: room.players.map(p => ({ id: p.id, name: p.name, color: p.color,
-      connected: p.connected, tokensLeft: p.tokensLeft })),
+      connected: p.connected, autoPilot: !!p.autoPilot, tokensLeft: p.tokensLeft })),
     spectators: (room.spectators || []).map(s => ({ id: s.id, name: s.name,
       connected: s.connected })),
     startWords: room.startWords,
@@ -602,6 +723,7 @@ module.exports = {
   resetConnectionsAfterRestart,
   setRuleSet, setWordPack, sanitizeWordPack, startGame,
   playWord, reinforce, endTurn, challenge, resolveChallenge, ensureAdjudicatorOnline,
+  isAutoPilot, enterAutoPilot, releaseAutoPilot, applyTurnMsOverride,
   computeScores, buildReplay, publicView, cascadeRemove, historySummary,
   isRoomExpired, pruneExpiredRooms, roomKey, ensureRoomId,
 };
